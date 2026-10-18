@@ -1,0 +1,12 @@
+{
+  "name": "quick-qa-helper",
+  "owner": { "name": "ouor" },
+  "description": "quick-qa: a Claude Code skill that runs Android UI QA tasks on a real device and reports back with one image.",
+  "plugins": [
+    {
+      "name": "quick-qa",
+      "source": "./",
+      "description": "Fast Android UI QA executor: one instruction in, a pass/fail report and a one-page report image out."
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+
+# run artifacts: screenshots of real devices, keep them out of the repo
+.quickqa-runs/
+quickqa-runs/
+
+# QQServer build leftovers (the shipped qqserver.jar is tracked)
+quickqa/server/build/
+quickqa/server/out.txt

@@ -1,0 +1,9 @@
+{
+  "name": "quick-qa",
+  "description": "Hand an Android UI QA task (\"open app X, do Y, check Z\") to a fast loop that drives a real device over adb and returns a pass/fail report with a one-page report image.",
+  "version": "0.1.0",
+  "author": { "name": "ouor" },
+  "homepage": "https://github.com/ouor/quick-qa-helper",
+  "repository": "https://github.com/ouor/quick-qa-helper",
+  "keywords": ["android", "qa", "adb", "testing"]
+}

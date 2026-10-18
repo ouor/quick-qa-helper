@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quick-qa-helper"
+version = "0.1.0"
+description = "Hand an Android UI QA task to a fast loop: Claude Haiku plans, TypeSafe Jev picks elements and verifies, adb acts."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = [
+    "anthropic>=1.15",
+    "requests>=2.31",
+    "Pillow>=10.0",
+]
+
+[project.scripts]
+quickqa = "quickqa.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/ouor/quick-qa-helper"
+
+[tool.setuptools]
+packages = ["quickqa"]
+
+[tool.setuptools.package-data]
+quickqa = ["server/qqserver.jar", "server/QQServer.java", "server/build.sh"]
