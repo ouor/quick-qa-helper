@@ -27,7 +27,7 @@ CASES = {
               "Check that the timer display shows 1m 30s (01:30)."),
     "chrome": ("com.android.chrome",
                "Open https://example.com in Chrome (dismiss any first-run screens without signing in) "
-               "and check that the page heading is 'Example Domain'."),
+               "and check that the page says it is 'for use in documentation examples'."),
     "contacts": ("com.android.contacts",
                  "Search contacts for 'zzqx' and confirm that no matching contact is found."),
     "files": ("com.android.documentsui",

@@ -61,6 +61,7 @@ class Element:
     enabled: bool = True
     password: bool = False
     label: str = ""  # text gathered from descendants (for clickable containers)
+    state: str = ""  # stateDescription, e.g. "Selected" on Compose chips (fast UI server only)
 
     @property
     def center(self) -> tuple[int, int]:
@@ -75,6 +76,8 @@ class Element:
             parts.append(f"desc=\"{self.desc[:80]}\"")
         if self.label and not self.text and not self.desc:
             parts.append(f"label=\"{self.label[:80]}\"")
+        if self.state:
+            parts.append(f"state=\"{self.state[:40]}\"")
         if self.rid:
             parts.append(f"id={self.rid}")
         flags = [n for n, v in (
@@ -161,7 +164,8 @@ def parse_hierarchy(xml: str, width: int, height: int) -> tuple[str, list[Elemen
                     bounds=(x1, y1, x2, y2), clickable=t("clickable"), long_clickable=t("long-clickable"),
                     scrollable=t("scrollable"), editable=editable, checkable=t("checkable"),
                     checked=t("checked"), selected=t("selected"), focused=t("focused"),
-                    enabled=a.get("enabled", "true") == "true", password=t("password"), label=label))
+                    enabled=a.get("enabled", "true") == "true", password=t("password"), label=label,
+                    state=(a.get("state-desc") or "").strip()))
         for child in node:
             walk(child, label or parent_label)
 
@@ -202,6 +206,19 @@ def thumbnail_signature(img: bytes | None) -> tuple:
     return tuple(v // 16 for v in im.convert("L").resize((12, 24)).getdata())
 
 
+def region_signature(img: bytes | None, bounds: tuple[int, int, int, int], width: int, height: int) -> tuple:
+    """Coarse fingerprint of one element's area, to tell whether a tap visibly changed it (e.g. a chip turning
+    highlighted when the app does not expose `selected` in the UI tree)."""
+    if not img or not width or not height:
+        return ()
+    from PIL import Image
+    im = Image.open(io.BytesIO(img)).convert("L")
+    sx, sy = im.width / width, im.height / height
+    x1, y1, x2, y2 = bounds
+    crop = im.crop((int(x1 * sx), int(y1 * sy), max(int(x2 * sx), int(x1 * sx) + 1), max(int(y2 * sy), int(y1 * sy) + 1)))
+    return tuple(v // 16 for v in crop.resize((16, 8)).getdata())
+
+
 class Device:
     def __init__(self, name: str):
         self.serial = resolve_serial(name)
@@ -229,11 +246,12 @@ class Device:
                 print(f"[quickqa] fast UI server unavailable, falling back to uiautomator dump: {ex}")
         return self._uiserver
 
-    def dump_xml(self, retries: int = 3) -> str:
+    def dump_xml(self, retries: int = 3, fresh: bool = False) -> str:
+        """fresh: re-read every node from the app instead of the server's accessibility cache (slower)."""
         srv = self._server()
         if srv:
             try:
-                out = srv.call("dump")
+                out = srv.call("dump fresh" if fresh else "dump")
                 if "<hierarchy" in out and "<node" in out:
                     return out
             except Exception as ex:
@@ -260,9 +278,19 @@ class Device:
                 pass
         return self.adb("exec-out", "screencap -p", timeout=30, binary=True)
 
-    def observe(self, with_screenshot: bool = True) -> Screen:
+    def screencap_png(self) -> bytes:
+        """Lossless full-resolution screenshot (slower than `screenshot`)."""
+        return self.adb("exec-out", "screencap -p", timeout=30, binary=True)
+
+    def home_package(self) -> str:
+        out = self.shell("cmd package resolve-activity --brief -a android.intent.action.MAIN "
+                         "-c android.intent.category.HOME")
+        last = out.strip().splitlines()[-1] if out.strip() else ""
+        return last.split("/")[0] if "/" in last else ""
+
+    def observe(self, with_screenshot: bool = True, fresh: bool = False) -> Screen:
         if self._server():
-            xml = self.dump_xml()
+            xml = self.dump_xml(fresh=fresh)
             img = self.screenshot() if with_screenshot else None
         else:
             from concurrent.futures import ThreadPoolExecutor
@@ -297,6 +325,15 @@ class Device:
     def long_press(self, x: int, y: int, ms: int = 800):
         self.shell(f"input swipe {x} {y} {x} {y} {ms}")
 
+    def multi_tap(self, x: int, y: int, count: int = 2, interval_ms: int = 120):
+        """Taps with exact spacing (double tap, sticky-key lock). Without the UI server each `input tap` starts a
+        process, so the spacing is ~0.2-0.5 s at best."""
+        srv = self._server()
+        if srv:
+            srv.call(f"taps {x} {y} {count} {interval_ms} 40")
+        else:
+            self.shell(f"; sleep {interval_ms / 1000:.3f}; ".join([f"input tap {x} {y}"] * count))
+
     def swipe(self, x1, y1, x2, y2, ms: int = 300):
         self.shell(f"input swipe {x1} {y1} {x2} {y2} {ms}")
 
@@ -316,6 +353,46 @@ class Device:
         out = self.shell("input keycombination 113 29 && input keyevent 67")
         if "Error" in out or "Unknown" in out:
             self.shell("input keyevent KEYCODE_MOVE_END && input keyevent " + " ".join(["67"] * 60))
+
+    def focused_text(self) -> str | None:
+        """Text of the focused input field via the UI server; None when unknown."""
+        srv = self._server()
+        if not srv:
+            return None
+        try:
+            out = srv.call("focused").strip()
+        except Exception:
+            return None
+        import base64
+        return None if out == "none" else base64.b64decode(out).decode("utf-8", "replace")
+
+    def type_into_focused(self, text: str, replace: bool = False) -> str:
+        """Type with key events (apps that react to keys see them), then check the field. A non-Latin keyboard
+        turns `input text` into jamo/kana and ADBKeyBoard is often missing, so a wrong result is rewritten through
+        the accessibility API (ACTION_SET_TEXT), which bypasses the keyboard. Returns how the text got in."""
+        before = "" if replace else self.focused_text()
+        try:
+            self.type_text(text)
+            how = "keys"
+        except RuntimeError:  # non-ASCII without ADBKeyBoard
+            how = "keys-unavailable"
+        time.sleep(0.2)
+        after = self.focused_text()
+        if after is None or (text in after and how == "keys"):
+            if how != "keys":
+                raise RuntimeError("non-ASCII text needs ADBKeyBoard or the fast UI server")
+            return how
+        import base64
+        b64 = base64.b64encode(((before or "") + text).encode()).decode()
+        self._server().call(f"settext {b64}")
+        return "set-text"
+
+    def swipe_precise(self, x1: int, y1: int, x2: int, y2: int, ms: int):
+        srv = self._server()
+        if srv:
+            srv.call(f"swipe {x1} {y1} {x2} {y2} {ms}")
+        else:
+            self.swipe(x1, y1, x2, y2, ms)
 
     def type_text(self, text: str):
         if text.isascii():

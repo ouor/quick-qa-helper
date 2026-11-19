@@ -25,18 +25,20 @@ MUTED = (92, 98, 110)
 ACCENT = (37, 99, 235)
 MARK = (230, 38, 38)
 STATUS_COLORS = {"passed": (22, 140, 72), "passed_weak": (200, 120, 0), "passed_with_crash_log": (200, 120, 0), "unverified": (200, 120, 0),
-                 "failed": (200, 40, 40), "max_steps": (200, 40, 40)}
+                 "failed": (200, 40, 40), "max_steps": (200, 40, 40), "stopped": (22, 140, 72)}
 # Fixed card texts. The planner writes the per-step purposes in the report language itself; these are the rest.
 STRINGS = {
     "en": {
         "title": "QA run report", "task": "Task: ",
         "status": {"passed": "Goal reached, finished", "passed_weak": "Weak pass (check it)",
                    "passed_with_crash_log": "Goal reached (crash log present)", "unverified": "Ended (not verified)",
-                   "failed": "Failed", "max_steps": "Stopped at step limit"},
+                   "failed": "Failed", "max_steps": "Stopped at step limit", "stopped": "Stop condition seen, stopped"},
         "failure": {"not_found": "Failed: element not found", "feature_missing": "Failed: feature missing",
-                    "app_error": "Failed: app error", "blocked": "Failed: blocked (login, permission...)"},
+                    "app_error": "Failed: app error", "blocked": "Failed: blocked (login, permission...)",
+                    "expectation_mismatch": "Failed: not as expected", "cannot_perform": "Failed: cannot perform",
+                    "left_app": "Stopped: left the app"},
         "dir": {"up": "up", "down": "down", "left": "left", "right": "right"},
-        "tap": "Tap: {}", "long_press": "Long-press: {}", "type": "Type: \"{}\" → {}", "scroll": "Scroll {}",
+        "tap": "Tap: {}", "long_press": "Long-press: {}", "multi_tap": "Quick taps: {}", "swipe": "Swipe {} {}", "type": "Type: \"{}\" → {}", "scroll": "Scroll {}",
         "back": "Back", "home": "Home", "enter": "Enter key", "launch": "Launch app: {}", "wait": "Wait {}s (loading)",
         "result": "Result: {}", "verifier": " · verifier p={:.3f}", "state": "App state changes ({}): ",
         "blocked": "Safe mode blocked {} tap(s)", "no_shot": "(no screenshot)",
@@ -45,11 +47,13 @@ STRINGS = {
         "title": "QA 실행 보고", "task": "작업: ",
         "status": {"passed": "목적 달성 및 종료", "passed_weak": "약하게 통과 (확인 필요)",
                    "passed_with_crash_log": "목적 달성 (크래시 로그 있음)", "unverified": "종료 (검증기 미확인)",
-                   "failed": "실패로 종료", "max_steps": "단계 한도 초과로 중단"},
+                   "failed": "실패로 종료", "max_steps": "단계 한도 초과로 중단", "stopped": "정지 조건 확인, 종료"},
         "failure": {"not_found": "실패: 요소를 찾지 못함", "feature_missing": "실패: 기능 없음",
-                    "app_error": "실패: 앱 오류", "blocked": "실패: 진행 불가 (로그인·권한 등)"},
+                    "app_error": "실패: 앱 오류", "blocked": "실패: 진행 불가 (로그인·권한 등)",
+                    "expectation_mismatch": "실패: 기대와 다름", "cannot_perform": "실패: 수행 불가",
+                    "left_app": "중단: 앱을 벗어남"},
         "dir": {"up": "위로", "down": "아래로", "left": "왼쪽으로", "right": "오른쪽으로"},
-        "tap": "탭: {}", "long_press": "길게 누르기: {}", "type": "입력: \"{}\" → {}", "scroll": "스크롤 {}",
+        "tap": "탭: {}", "long_press": "길게 누르기: {}", "multi_tap": "빠른 연속 탭: {}", "swipe": "{} 스와이프 {}", "type": "입력: \"{}\" → {}", "scroll": "스크롤 {}",
         "back": "뒤로 가기", "home": "홈으로 이동", "enter": "엔터 키 입력", "launch": "앱 실행: {}",
         "wait": "{}초 대기 (로딩)", "result": "결과: {}", "verifier": " · 검증 p={:.3f}", "state": "앱 상태 변경 {}건: ",
         "blocked": "안전 모드 차단 {}건", "no_shot": "(스크린샷 없음)",
@@ -99,6 +103,7 @@ class Card:
     point: tuple[int, int] | None = None     # device px
     bounds: tuple | None = None              # device px
     direction: str = ""
+    path: tuple | None = None                # device px (x1, y1, x2, y2) of a swipe
     count: int = 1
     final: bool = False
     status: str = ""
@@ -109,12 +114,14 @@ def _operation(step, t: dict) -> str:
     p, sel = step.plan, step.selection
     a, label = p["action"], (sel.get("label") or p["target"] or "").strip()
     label = label.replace("\n", " ")
-    if a in ("tap", "long_press"):
+    if a in ("tap", "long_press", "multi_tap"):
         op = t[a].format(label)
     elif a == "type":
         op = t["type"].format(p["text"], label)
     elif a == "scroll":
         op = t["scroll"].format(t["dir"].get(sel.get("direction") or p["direction"], ""))
+    elif a == "swipe":
+        op = t["swipe"].format(t["dir"].get(p["direction"], ""), label or "")
     elif a in ("back", "home", "enter"):
         op = t[a]
     elif a == "launch":
@@ -148,7 +155,7 @@ def build_cards(steps, status: str, verified: float | None, final_shot: bytes | 
             purpose=s.plan.get("purpose") or s.plan["thought"], operation=op, thumb=s.thumb, action=a,
             point=(sel["x"], sel["y"]) if "x" in sel else None,
             bounds=tuple(sel["bounds"]) if sel.get("bounds") else None,
-            direction=sel.get("direction", "")))
+            direction=sel.get("direction", ""), path=tuple(sel["path"]) if sel.get("path") else None))
     conclusion = ""
     if last is not None:
         conclusion = last.plan.get("purpose") or last.plan["thought"]
@@ -194,6 +201,16 @@ def _wrap(draw, text: str, font, width: int, max_lines: int) -> list[str]:
     return lines
 
 
+def _arrow(d, x0: float, y0: float, x1: float, y1: float):
+    d.line((x0, y0, x1, y1), fill=MARK, width=7)
+    L = max(1.0, ((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5)
+    ux, uy = (x1 - x0) / L, (y1 - y0) / L
+    head = 20
+    d.polygon([(x1 + ux * head, y1 + uy * head),
+               (x1 - uy * head * 0.8, y1 + ux * head * 0.8),
+               (x1 + uy * head * 0.8, y1 - ux * head * 0.8)], fill=MARK)
+
+
 def _thumb(card: Card, dev_w: int, dev_h: int, thumb_h: int, no_shot: str = "(no screenshot)") -> Image.Image:
     if not card.thumb:
         im = Image.new("RGB", (THUMB_W, thumb_h), (220, 222, 226))
@@ -203,10 +220,10 @@ def _thumb(card: Card, dev_w: int, dev_h: int, thumb_h: int, no_shot: str = "(no
     im = Image.open(io.BytesIO(card.thumb)).convert("RGB").resize((THUMB_W, thumb_h))
     d = ImageDraw.Draw(im)
     sx, sy = THUMB_W / max(1, dev_w), thumb_h / max(1, dev_h)
-    if card.bounds and card.action in ("type", "long_press", "tap"):
+    if card.bounds and card.action in ("type", "long_press", "tap", "multi_tap"):
         x1, y1, x2, y2 = card.bounds
         d.rectangle((x1 * sx, y1 * sy, x2 * sx, y2 * sy), outline=MARK, width=2)
-    if card.point and card.action in ("tap", "long_press", "type"):
+    if card.point and card.action in ("tap", "long_press", "type", "multi_tap"):
         x, y = card.point[0] * sx, card.point[1] * sy
         r = 13
         d.ellipse((x - r, y - r, x + r, y + r), outline=MARK, width=4)
@@ -220,12 +237,10 @@ def _thumb(card: Card, dev_w: int, dev_h: int, thumb_h: int, no_shot: str = "(no
         vec = {"down": (0, L), "up": (0, -L), "right": (L, 0), "left": (-L, 0)}.get(card.direction, (0, L))
         ex, ey = cx + vec[0], cy + vec[1]
         sx0, sy0 = cx - vec[0], cy - vec[1]
-        d.line((sx0, sy0, ex, ey), fill=MARK, width=7)
-        ux, uy = vec[0] / L, vec[1] / L
-        head = 20
-        d.polygon([(ex + ux * head, ey + uy * head),
-                   (ex - uy * head * 0.8, ey + ux * head * 0.8),
-                   (ex + uy * head * 0.8, ey - ux * head * 0.8)], fill=MARK)
+        _arrow(d, sx0, sy0, ex, ey)
+    if card.action == "swipe" and card.path:
+        x1, y1, x2, y2 = card.path
+        _arrow(d, x1 * sx, y1 * sy, x2 * sx, y2 * sy)
     if card.action in ("back", "home", "enter", "launch", "wait"):
         f_badge = _font(16, True)
         badge = {"back": "◀ BACK", "home": "● HOME", "enter": "ENTER", "launch": "▶ LAUNCH", "wait": "WAIT"}[card.action]

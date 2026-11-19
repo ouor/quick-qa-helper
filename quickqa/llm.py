@@ -1,4 +1,4 @@
-"""Planner clients (Claude Haiku 5.5 by default, Cerebras optional) and TypeSafe Jev (selector / verifier)."""
+"""Planner clients (Claude Sonnet 5.5 by default, Cerebras optional) and TypeSafe Jev (selector / verifier)."""
 from __future__ import annotations
 
 import base64
@@ -52,16 +52,19 @@ class PromptTooLarge(Exception):
 
 
 class Claude:
-    """Planner on the Claude API (default claude-haiku-5-5).
+    """Planner on the Claude API (default claude-sonnet-5-5).
 
-    Haiku 5.5 bills $0.10/MTok input only while a prompt is <= 100K tokens ($0.50 above), so every request is
-    checked against `max_input_tokens` before it is sent: a cheap local estimate, and an exact count_tokens
-    call only when the estimate gets near the limit. The caller shrinks the prompt on PromptTooLarge.
+    Every request is checked against `max_input_tokens` before it is sent: a cheap local estimate, and an exact
+    count_tokens call only when the estimate gets near the limit. The caller shrinks the prompt on PromptTooLarge.
+    (Haiku 5.5 bills 5x more per input token above 100K tokens, which is why the default ceiling is 100K.)
     """
 
-    PRICE_IN, PRICE_OUT = 0.10, 0.50  # USD / MTok for prompts <= 100K tokens
+    # USD / MTok (input, output); Haiku's rate is for prompts <= 100K tokens
+    PRICES = {"claude-sonnet-5-5": (2.00, 10.00), "claude-haiku-5-5": (0.10, 0.50), "claude-opus-5-5": (4.00, 20.00)}
+    # models whose refusals are re-run server-side on a fallback model within the same call
+    FALLBACK_MODELS = {"claude-sonnet-5-5", "claude-opus-5-5"}
 
-    def __init__(self, model: str = "claude-haiku-5-5", effort: str = "medium", max_input_tokens: int = 100_000):
+    def __init__(self, model: str = "claude-sonnet-5-5", effort: str = "medium", max_input_tokens: int = 100_000):
         import anthropic
         key = _user_env("ANTHROPIC_API_KEY")
         if not key:
@@ -98,11 +101,17 @@ class Claude:
             if n > self.max_input_tokens:
                 raise PromptTooLarge(n)
         if self.effort == "none":
-            extra = dict(thinking={"type": "disabled"}, output_config={"effort": "low"})
+            # Sonnet 5.5 rejects "disabled"; "between_tools" is its thinking-off mode
+            off = "between_tools" if self.model.startswith("claude-sonnet-5-5") else "disabled"
+            extra = dict(thinking={"type": off}, output_config={"effort": "low"})
         else:
             extra = dict(thinking={"type": "adaptive"}, output_config={"effort": self.effort})
         extra["output_config"]["format"] = {"type": "json_schema", "schema": schema}
-        resp = self.client.messages.create(max_tokens=max_tokens, **kw, **extra)
+        if self.model in self.FALLBACK_MODELS:
+            resp = self.client.beta.messages.create(max_tokens=max_tokens, betas=["server-side-fallback-2026-07-01"],
+                                                    fallbacks="default", **kw, **extra)
+        else:
+            resp = self.client.messages.create(max_tokens=max_tokens, **kw, **extra)
         u = resp.usage
         self.calls += 1
         self.input_tokens += u.input_tokens
@@ -116,10 +125,10 @@ class Claude:
         return json.loads(text), {"input_tokens": u.input_tokens, "output_tokens": u.output_tokens}
 
     def usage_report(self) -> dict:
+        price_in, price_out = self.PRICES.get(self.model, (0.0, 0.0))
         return {"model": self.model, "calls": self.calls, "input_tokens": self.input_tokens,
                 "output_tokens": self.output_tokens, "peak_input_tokens": self.peak_input_tokens,
-                "est_cost_usd": round(self.input_tokens * self.PRICE_IN / 1e6
-                                      + self.output_tokens * self.PRICE_OUT / 1e6, 5)}
+                "est_cost_usd": round(self.input_tokens * price_in / 1e6 + self.output_tokens * price_out / 1e6, 5)}
 
 
 class Cerebras:
