@@ -10,7 +10,7 @@ agent / you  ──▶  quickqa "<task>" --app <package>
    ┌─────────────────┴───────────────────────────────────────────────────┐
    │ loop (≈3–4 s per step)                                              │
    │  1. observe  QQServer on the device (UiAutomation, kept alive) 0.25 s│
-   │  2. plan     Claude Haiku 5.5 picks the next action          2–3 s  │
+   │  2. plan     Claude Sonnet 5.5 picks the next action         2–4 s  │
    │  3. select   TypeSafe Jev picks the element (Box on screenshot      │
    │              when the UI tree has no node for it)          0.2–0.5 s│
    │  4. act      adb input                                       0.2 s  │
@@ -62,7 +62,10 @@ Write one concrete, checkable behavior per run, and include the expected result.
 | option | default | |
 |---|---|---|
 | `--app PKG` | none | App to test (`package` or `package/.Activity`). Force-stopped and launched fresh. |
-| `--start restart\|resume` | `restart` | `resume` keeps the state the previous run left. |
+| `--start restart\|resume` | `restart` | `resume` skips the force-stop and starts on the screen the app was left on. |
+| `--stop-when TEXT` | | End the run as soon as TEXT is on screen, pressing nothing more (status `stopped`). |
+| `--shot PATH` | | Also save the final screen as a full-resolution PNG at PATH. |
+| `--pre CMD` / `--post CMD` | | Shell commands run on the PC before / after the run. A failing `--pre` aborts; `--post` always runs. |
 | `--device SERIAL` | `$QUICKQA_DEVICE`, else the only connected device | adb serial, or the host name of a wireless serial (`host:port`). |
 | `--no-safe` | safe mode on | Safe mode blocks state-changing taps (delete, settings, view/sort/filter modes, toggles) that the task does not need. |
 | `--effort none\|low\|medium\|high` | `medium` | Planner effort. `low` loses its way in long multi-page flows. |
@@ -78,7 +81,7 @@ Write one concrete, checkable behavior per run, and include the expected result.
 ```
 STATUS: passed  (verifier p_done=0.97, 6 steps, 10.4s)
 SUMMARY: ...
-PLANNER: claude-haiku-5-5 6 calls, in 14k / out 2k tokens (peak prompt 2.6k), ~$0.003
+PLANNER: claude-sonnet-5-5 6 calls, in 14k / out 2k tokens (peak prompt 2.6k), ~$0.06
 REPORT IMAGE: .../report.png
 REPORT: .../report.json
 FINAL SCREENSHOT: .../final.jpg
@@ -89,9 +92,12 @@ FINAL SCREENSHOT: .../final.jpg
 | `passed` | 0 | Planner finished and the verifier agreed (p ≥ 0.7). |
 | `passed_weak` | 0 | The verifier only just agreed (0.5–0.7). Look at the report image. |
 | `passed_with_crash_log` | 0 | Passed, but `logcat -b crash` has new entries. |
+| `stopped` | 0 | The `--stop-when` text appeared. |
 | `unverified` | 3 | The planner said done twice and the verifier disagreed. |
-| `failed` | 1 | `FAILURE KIND`: `not_found` (searched, could not find it), `feature_missing` (the app shows it is absent), `app_error`, `blocked`. |
-| `max_steps` | 2 | Ran out of steps. |
+| `failed` | 1 | `FAILURE KIND`: `not_found` (searched, could not find it), `feature_missing` (the app shows it is absent), `expectation_mismatch` (something else is shown; "found instead"), `cannot_perform` (a gesture or check quick-qa cannot do), `app_error` (crash or error seen), `blocked`, `left_app` (fell out to the home screen). |
+| `max_steps` | 2 | Ran out of steps; the verifier still scores the final screen. |
+
+`UNCONFIRMED` lists parts of the task the run could not confirm on screen.
 
 `report.png` is a one-page summary built for an agent to read. It holds numbered cards, each with the step's
 purpose, the operation, and the screenshot with the tap point or scroll arrow marked, and ends with a result
@@ -105,15 +111,22 @@ For debuggable builds the run also lists the SharedPreferences keys and data fil
   keeps one UiAutomation connection open. A UI dump plus a screenshot takes about 0.25 s instead of
   about 2.3 s for `uiautomator dump` plus `screencap`. It is pushed to `/data/local/tmp` automatically and exits
   when the run ends. Set `QUICKQA_NO_SERVER=1` to use plain `uiautomator dump`.
-- **Planner** (`claude-haiku-5-5`) sees the task, recent actions, notes from earlier steps, and the screen as
+- **Planner** (`claude-sonnet-5-5`) sees the task, recent actions, notes from earlier steps, and the screen as
   a list of elements. It answers with one action as structured JSON. Prompts are 2–8K tokens, and a 30-step
-  run costs about $0.01–0.04. `--planner cerebras --planner-model ...` uses Cerebras instead
+  run costs about $0.1–0.3 (a step is about $0.01). `--planner-model claude-haiku-5-5` is ~20x cheaper but
+  loses its way more often in long flows. `--planner cerebras --planner-model ...` uses Cerebras instead
   (`CEREBRAS_API_KEY`).
 - **Selector** (TypeSafe Jev) turns the planner's description of a target into a concrete element (Choice
   plus a Noul "is it there"). When the tree has no such node, a Box question on the screenshot locates it.
 - **Verifier** (two Jev Noul phrasings, averaged) checks a "done" claim against the screen and the notes.
+- **Settling**: after each action the screen is re-read until two reads agree, so the planner never decides on
+  a half-finished transition. If the picture changed but the element list did not, the tree is re-read
+  bypassing the accessibility cache. A tap is not sent if the screen changed while the planner was thinking.
 - **Guards**:
   - A warning fires when the planner repeats one move 4 times in 6 steps.
+  - After a tap, the planner is told whether the tapped element visibly changed (for apps that do not expose
+    selected/checked state).
+  - Falling out of `--app` to the home screen stops the run (`left_app`) instead of relaunching.
   - A "not found" failure is sent back once if the planner has not yet scrolled to the top and gone back.
   - Safe mode runs a Jev check before a state-changing tap.
 
@@ -125,6 +138,8 @@ For debuggable builds the run also lists the SharedPreferences keys and data fil
 
 - Typing non-ASCII text (Korean, Japanese, ...) needs the [ADBKeyBoard](https://github.com/senzhk/ADBKeyBoard)
   IME on the device.
+- Timed gestures (double tap, quick repeated taps, timed long press) run as one injected gesture.
+- Effects that never show on screen (clipboard, sound) cannot be confirmed.
 - Run one task at a time per device. Two runs on one device fight over the screen, and UiAutomation allows
   only one client.
 - Search terms are typed literally. On a device set to another language, ask for the term in that language.

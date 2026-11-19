@@ -2,7 +2,7 @@
 
 Per step:
   1. observe   - uiautomator dump + screenshot in parallel (adb)
-  2. plan      - Claude Haiku 5.5 decides the next action (structured JSON output)
+  2. plan      - Claude Sonnet 5.5 decides the next action (structured JSON output)
   3. select    - TypeSafe Jev picks the concrete element (Choice + Noul), falling back to
                  a Box question on the screenshot when the hierarchy has no matching node
   4. act       - adb input
@@ -16,14 +16,16 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .device import Device, Element, Screen, downscale_jpeg, thumbnail_signature
+from .device import Device, Element, Screen, downscale_jpeg, region_signature, thumbnail_signature
 from .llm import Cerebras, Claude, Jev, PromptTooLarge, new_image_ref
 from .state import app_state_snapshot, diff_app_state
 
-TARGETED = {"tap", "long_press", "type"}
-ACTIONS = ["tap", "long_press", "type", "scroll", "back", "home", "enter", "launch", "wait", "look", "none"]
+TARGETED = {"tap", "long_press", "multi_tap", "type"}
+ACTIONS = ["tap", "long_press", "multi_tap", "type", "swipe", "scroll", "back", "home", "enter", "launch", "wait", "look", "none"]
 # not_found: searched and could not locate it; feature_missing: positive evidence the app lacks it.
-FAILURE_KINDS = ["", "not_found", "feature_missing", "app_error", "blocked"]
+# expectation_mismatch: the screen shows something other than what the task expects (found-instead in observation).
+# cannot_perform: the task needs a gesture, timing or action quick-qa cannot (or the task forbids) do.
+FAILURE_KINDS = ["", "not_found", "feature_missing", "expectation_mismatch", "cannot_perform", "app_error", "blocked"]
 
 PLAN_SCHEMA = {
     "type": "object",
@@ -39,9 +41,10 @@ PLAN_SCHEMA = {
         "direction": {"type": "string", "enum": ["up", "down", "left", "right", "none"]},
         "clear_first": {"type": "boolean"},
         "failure_kind": {"type": "string", "enum": FAILURE_KINDS},
+        "unconfirmed": {"type": "string"},
     },
     "required": ["thought", "purpose", "observation", "status", "action", "target", "element_hint", "text",
-                 "direction", "clear_first", "failure_kind"],
+                 "direction", "clear_first", "failure_kind", "unconfirmed"],
     "additionalProperties": False,
 }
 
@@ -58,10 +61,19 @@ Fields:
   the task asked you to check). "" if nothing.
 - status: "continue" while work remains; "done" when the task's goal is visibly achieved on the CURRENT screen
   (set action "none"); "failed" if it cannot be achieved (app crashed, feature missing, blocked) - explain in observation.
-- action: tap | long_press | type | scroll | back | home | enter | launch | wait | none
+- action: tap | long_press | multi_tap | type | swipe | scroll | back | home | enter | launch | wait | look | none
   * tap/long_press: target = short natural-language description of the element (e.g. "the '+' add button").
+    long_press: text = hold time in ms if the task gives one (default "800").
+  * multi_tap: quick repeated taps on one element with exact timing, for anything time-critical (double tap,
+    "tap twice quickly", sticky/lock keys). text = "COUNT@INTERVAL_MS", e.g. "2@120". Separate tap steps are
+    seconds apart and never count as a double tap.
   * type: target = the input field; text = what to type; clear_first = true to replace existing content.
   * scroll: direction = where the hidden content is ("down" reveals content below); target = scrollable container or "".
+  * swipe: a finger gesture that is not "reveal more content": swipe a list item to dismiss/archive it, flick a
+    card/page/carousel, drag a slider or a bottom sheet, pull down to refresh, open the notification shade or a
+    drawer. direction = where the FINGER moves. target = the element to swipe on ("" = the whole screen).
+    text = any of "short" (30% of the element, default 80%), "edge" (start at the screen edge, e.g. direction
+    "down" + "edge" opens the notification shade), "slow" (drag instead of fling, for sliders and reordering).
   * launch: text = package name (or package/activity).
   * wait: text = seconds (e.g. "1.5"), for loading screens.
   * look: attach a screenshot to your next turn. Use it when the element list does not show what you need
@@ -71,8 +83,15 @@ Fields:
 - text, direction ("none" if unused), clear_first (false if unused).
 - failure_kind: "" unless status is "failed". Then: "not_found" = you searched (see below) and could not locate
   the element/screen; "feature_missing" = the app positively shows the feature does not exist (an explicit message,
-  a disabled/absent option in the place it must be) - never merely because you did not see it; "app_error" = crash,
-  error dialog, hang; "blocked" = a login wall, missing permission or data you may not create.
+  a disabled/absent option in the place it must be) - never merely because you did not see it;
+  "expectation_mismatch" = the app works but shows something other than what the task expects (the expected text is
+  in another element, a different value, nothing changed) - start observation with "found instead: ...";
+  "cannot_perform" = the task needs something you cannot do (a gesture or timing you have no action for, an effect
+  that never shows on screen, or a check that is only possible through an action the task forbids);
+  "app_error" = ONLY a crash, an error dialog/message, or a frozen app you saw; "blocked" = a login wall, missing
+  permission or data you may not create.
+- unconfirmed: what the task asked for that you could NOT confirm on screen (e.g. "chip '절전' selection: the
+  element list has no selected/checked state and the screenshot is unclear"), "" if nothing.
 
 Rules: do exactly what the task asks, nothing more. If the task asks to perform an action N times, count the
 matching actions in RECENT ACTIONS and stop at N. When a task asks you to check a change, record the
@@ -84,10 +103,17 @@ Do not declare done unless the current screen proves it.
 Report only values you actually saw in the element list or an attached screenshot in this run - never from
 memory or general knowledge. If a value you need is not visible, scroll or use "look" to find it.
 When a screenshot is attached, it is the ground truth for content the element list does not show.
+Selection state: many apps do not expose selected/checked state in the element list. After tapping such an element,
+RECENT ACTIONS says whether the tapped element "looks changed" on screen; use "look" once if you need more. If you
+still cannot tell, write it in unconfirmed and move on to the rest of the task - never re-tap a selectable element
+just to confirm it (a second tap may undo it). A value you confirmed earlier (in NOTES / RECENT ACTIONS) stays
+confirmed after it scrolls out of view. When everything the task asks is done except details you could not confirm,
+declare done and list them in unconfirmed.
 
 Finding things: when the element you need is not in the list, it is usually just off screen. Many apps collapse
 the top bar (search, ⋮ overflow menu) when the content is scrolled, so FIRST scroll up to the very top, then look
-in ⋮ / overflow menus, then scroll down, then go back or relaunch the app and look again. Do not tap unrelated
+in ⋮ / overflow menus, then scroll down, then go back and look again. Relaunching the app resets state set up
+earlier in the run, so only relaunch when the task has not set anything up yet. Do not tap unrelated
 buttons (filters, view-mode/layout toggles, sort options, settings) to explore - those change saved app state.
 Counting and positions: count items and judge columns/rows from the element list bounds, not from a screenshot
 estimate, and say in observation that you counted from the element list. "Scroll to the bottom/end" means keep
@@ -111,6 +137,20 @@ VERIFY_IMAGE_SIDE = 768
 BOX_IMAGE_SIDE = 1024
 
 
+def _int(v: str, default: int, lo: int, hi: int) -> int:
+    try:
+        return max(lo, min(hi, int(float(v))))
+    except (TypeError, ValueError):
+        return default
+
+
+def _sig(screen: Screen) -> tuple:
+    return (screen.package, tuple(e.describe() for e in screen.elements), thumbnail_signature(screen.screenshot))
+
+
+SETTLE_READS = 6  # after an action, re-read the screen until two reads agree (at most this many extra reads)
+
+
 def _ext(img: bytes) -> str:
     return ".png" if img[:4] == b"\x89PNG" else ".jpg"
 
@@ -132,8 +172,9 @@ class QARunner:
                  planner: str = "claude", planner_model: str | None = None, max_input_tokens: int = 100_000,
                  image_side: int = PLANNER_IMAGE_SIDE, report_lang: str = "English", report_image: bool = True,
                  run_dir: Path | None = None, save_screens: bool = False, verbose: bool = True,
-                 safe: bool = True):
+                 safe: bool = True, stop_when: str | None = None):
         self.d, self.task, self.app = device, task, app
+        self.stop_when = (stop_when or "").strip()
         self.safe = safe
         self.blocked_taps: list[str] = []
         self.max_steps, self.vision, self.restart_app = max_steps, vision, restart_app
@@ -143,7 +184,7 @@ class QARunner:
         if planner == "cerebras":
             self.planner = Cerebras(model=planner_model or "qwen-3.8-27b", reasoning_effort=reasoning_effort)
         else:
-            self.planner = Claude(model=planner_model or "claude-haiku-5-5", effort=reasoning_effort,
+            self.planner = Claude(model=planner_model or "claude-sonnet-5-5", effort=reasoning_effort,
                                   max_input_tokens=max_input_tokens)
         self.jev = Jev()
         self.run_dir, self.save_screens, self.verbose = run_dir, save_screens, verbose
@@ -162,8 +203,8 @@ class QARunner:
         for s in self.steps[-window:]:
             p = s.plan
             tgt = s.selection.get("described") or p.get("target") or ""
-            extra = f' text="{p["text"]}"' if p["action"] in ("type", "launch", "wait") and p.get("text") else ""
-            extra += f' dir={p["direction"]}' if p["action"] == "scroll" else ""
+            extra = f' text="{p["text"]}"' if p["action"] in ("type", "launch", "wait", "multi_tap", "long_press", "swipe") and p.get("text") else ""
+            extra += f' dir={p["direction"]}' if p["action"] in ("scroll", "swipe") else ""
             line = f'{s.n}. {p["action"]} {tgt[:100]}{extra} -> {s.result}'
             if p.get("observation"):
                 # Earlier observations are the planner's only memory of before/after values.
@@ -224,7 +265,7 @@ class QARunner:
         hint = plan["element_hint"] if screen.by_id(plan["element_hint"]) else ""
         sel: dict = {"target": target, "hint": hint or None}
         if cands:
-            verb = {"tap": "tap", "long_press": "long-press", "type": "type into"}[action]
+            verb = {"tap": "tap", "long_press": "long-press", "multi_tap": "tap", "type": "type into", "swipe": "swipe"}[action]
             elements = {e.id: e.describe() for e in cands}
             answers = self.jev.ask(
                 state={"task": self.task, "screen_elements": elements},
@@ -295,18 +336,20 @@ class QARunner:
 
     def _safe_block(self, screen: Screen, plan: dict, sel: dict) -> str:
         """Safe mode: ask Jev whether a state-changing tap is actually required by the task; block it if not."""
-        if plan["action"] not in ("tap", "long_press") or sel.get("how") == "not-found":
+        if plan["action"] not in ("tap", "long_press", "multi_tap", "swipe") or sel.get("how") in ("not-found", None):
             return ""
         el = screen.by_id(sel.get("element", ""))
         label = sel.get("label") or plan["target"]
         text = " ".join(filter(None, [label, el.desc if el else "", el.rid if el else ""]))
-        risky = (el is not None and el.checkable) or (RISKY.search(text) and not SAFE_NAV.search(text))
+        # a swipe on an item often deletes or archives it, whatever its label says
+        risky = (plan["action"] == "swipe" or (el is not None and el.checkable)
+                 or (RISKY.search(text) and not SAFE_NAV.search(text)))
         if not risky:
             return ""
         p = self.jev.ask(
             {"task": self.task, "control": sel.get("described") or label, "why_agent_taps_it": plan["thought"]},
             {"needed": {"type": "noul",
-                        "instructions": "Is tapping `control` required by the `task` - the task names this control "
+                        "instructions": "Is tapping/swiping `control` required by the `task` - the task names this control "
                                         "or its effect, or the task cannot be completed without it?",
                         "criteria": {"true": "The task asks for this, or it is a necessary step toward the task.",
                                      "false": "It is exploration or an unrelated change: deleting data, changing a "
@@ -359,7 +402,10 @@ class QARunner:
             if a == "tap":
                 self.d.tap(x, y)
             elif a == "long_press":
-                self.d.long_press(x, y)
+                self.d.long_press(x, y, _int(plan["text"], 800, 100, 10_000))
+            elif a == "multi_tap":
+                count, _, interval = (plan["text"] or "2").partition("@")
+                self.d.multi_tap(x, y, _int(count, 2, 2, 10), _int(interval, 120, 30, 2000))
             else:
                 el = screen.by_id(sel.get("element", ""))
                 if not (el and el.focused):
@@ -367,7 +413,16 @@ class QARunner:
                     time.sleep(0.25)
                 if plan["clear_first"]:
                     self.d.clear_focused_field()
-                self.d.type_text(plan["text"])
+                if self.d.type_into_focused(plan["text"], replace=plan["clear_first"]) == "set-text":
+                    return "ok (keyboard mangled the text; set it directly)"
+            return "ok"
+        if a == "swipe":
+            if sel.get("how") == "not-found":
+                return f"target not found on screen: {plan['target']}"
+            bounds = tuple(sel["bounds"]) if sel.get("bounds") else None
+            x1, y1, x2, y2 = self._swipe_path(plan, bounds, screen.width, screen.height)
+            self.d.swipe_precise(x1, y1, x2, y2, 400 if "slow" in plan["text"] else 150)
+            sel.update(path=(x1, y1, x2, y2), direction=plan["direction"])
             return "ok"
         if a == "scroll":
             direction = plan["direction"] if plan["direction"] != "none" else "down"
@@ -394,6 +449,57 @@ class QARunner:
             return "ok"
         return "no-op"
 
+    def _observe(self, before: Screen | None, acted: bool) -> tuple[Screen, float]:
+        """Read the screen once it has stopped changing after an action; returns (screen, seconds it took to settle).
+
+        Reading mid-transition made the planner see the old screen, think its tap/back did nothing and repeat it.
+        """
+        t = time.time()
+        screen = self.d.observe(with_screenshot=True)
+        if not acted:
+            return screen, 0.0
+        for _ in range(SETTLE_READS):
+            time.sleep(0.3)
+            again = self.d.observe(with_screenshot=True)
+            if _sig(again) == _sig(screen):
+                break
+            screen = again
+        # The picture changed but the element list did not: the UI server's accessibility cache is stale.
+        if (before is not None and thumbnail_signature(screen.screenshot) != thumbnail_signature(before.screenshot)
+                and _sig(screen)[:2] == _sig(before)[:2]):
+            screen = self.d.observe(with_screenshot=True, fresh=True)
+        return screen, round(time.time() - t, 2)
+
+    def _screen_moved(self, screen: Screen, bounds) -> bool:
+        """Did the target's area change while the planner was thinking? Then the tap may hit something else.
+        Only the target area counts: a blinking caret or a loading feed elsewhere must not hold the tap back."""
+        if not bounds:
+            return False
+        try:
+            now = self.d.screenshot()
+        except Exception:
+            return False
+        b = tuple(bounds)
+        return (region_signature(now, b, screen.width, screen.height)
+                != region_signature(screen.screenshot, b, screen.width, screen.height))
+
+    @staticmethod
+    def _swipe_path(plan: dict, bounds, w: int, h: int) -> tuple[int, int, int, int]:
+        """Finger path for a swipe: across the target element, or from a screen edge with "edge"."""
+        direction = plan["direction"] if plan["direction"] != "none" else "left"
+        dx, dy = {"left": (-1, 0), "right": (1, 0), "up": (0, -1), "down": (0, 1)}[direction]
+        if "edge" in plan["text"]:
+            # start just inside the edge opposite to the movement (top edge for "down" = notification shade)
+            x1 = {1: 2, -1: w - 3}.get(dx, w // 2)
+            y1 = {1: 2, -1: h - 3}.get(dy, h // 2)
+            frac = 0.5
+            return x1, y1, round(x1 + dx * w * frac), round(y1 + dy * h * frac)
+        bx1, by1, bx2, by2 = bounds or (0, 0, w, h)
+        cx, cy = (bx1 + bx2) // 2, (by1 + by2) // 2
+        frac = 0.3 if "short" in plan["text"] else 0.8
+        half_x, half_y = (bx2 - bx1) * frac / 2, (by2 - by1) * frac / 2
+        return (round(cx - dx * half_x), round(cy - dy * half_y), round(cx + dx * half_x), round(cy + dy * half_y))
+
     # ------------------------------------------------------------------ main loop
     def run(self) -> dict:
         t0 = time.time()
@@ -417,21 +523,53 @@ class QARunner:
         verified = None
         failure_pushback, failure_kind = False, ""
         state_before = app_state_snapshot(self.d, self.app) if self.app else None
+        home = self.d.home_package() if self.app else ""
+        prev_screen: Screen | None = None
+        prev_pkg, moved_skips = "", 0
 
         for n in range(1, self.max_steps + 1):
             tm: dict = {}
             t = time.time()
-            screen = self.d.observe(with_screenshot=True)
+            last = self.steps[-1] if self.steps else None
+            acted = bool(last) and last.result.startswith("ok")
+            screen, tm["settle"] = self._observe(prev_screen, acted)
             tm["observe"] = round(time.time() - t, 2)
             final_screen = screen
             if self.save_screens and self.run_dir and screen.screenshot:
                 (self.run_dir / f"step{n:02d}{_ext(screen.screenshot)}").write_bytes(screen.screenshot)
 
-            sig = (screen.package, tuple(e.describe() for e in screen.elements), thumbnail_signature(screen.screenshot))
+            sig = _sig(screen)
             same_count = same_count + 1 if sig == prev_sig else 0
             if self.steps and same_count:
                 self.steps[-1].result += " (screen unchanged)"
             prev_sig = sig
+            if acted and last.plan["action"] in ("tap", "multi_tap") and last.selection.get("bounds") and prev_screen:
+                # The UI tree often lacks selected/checked state; say whether the tapped area itself changed.
+                b = tuple(last.selection["bounds"])
+                changed = (region_signature(prev_screen.screenshot, b, prev_screen.width, prev_screen.height)
+                           != region_signature(screen.screenshot, b, screen.width, screen.height))
+                last.result += " (tapped element looks changed)" if changed else " (tapped element looks the same)"
+            prev_screen = screen
+
+            if self.stop_when and any(self.stop_when in v for e in screen.elements
+                                      for v in (e.text, e.desc, e.label, e.state) if v):
+                status = "stopped"
+                self.observations.append(f"step {n}: stop text '{self.stop_when}' is on screen; stopped without acting")
+                self.log(f"[{n}] stop text {self.stop_when!r} seen; stopping")
+                break
+            app_pkg = (self.app or "").split("/")[0]
+            fell_out = last and (
+                (home and screen.package == home and last.plan["action"] != "home")
+                or (last.plan["action"] == "back" and prev_pkg == app_pkg and screen.package != app_pkg))
+            prev_pkg = screen.package
+            if fell_out:
+                # One back too many lands on the launcher or the previous app. Relaunching would silently reset
+                # what the run set up, so stop and say so.
+                status, failure_kind = "failed", "left_app"
+                self.observations.append(f"step {n}: left {self.app} for {screen.package} after step {last.n} "
+                                         f"({last.plan['action']}); stopped instead of relaunching")
+                self.log(f"[{n}] left the app; stopping")
+                break
 
             t = time.time()
             try:
@@ -484,7 +622,7 @@ class QARunner:
                 status, failure_kind = "failed", plan["failure_kind"]
                 break
 
-            if plan["action"] in TARGETED:
+            if plan["action"] in TARGETED or (plan["action"] == "swipe" and plan["target"].strip()):
                 t = time.time()
                 step.selection = self.select(screen, plan)
                 tm["select"] = round(time.time() - t, 2)
@@ -493,6 +631,13 @@ class QARunner:
             t = time.time()
             try:
                 blocked = self._safe_block(screen, plan, step.selection) if self.safe else ""
+                if (not blocked and plan["action"] in TARGETED and moved_skips < 2
+                        and self._screen_moved(screen, step.selection.get("bounds"))):
+                    # shortcut: a screen that animates nonstop (video, carousel) gets two skips, then taps anyway
+                    moved_skips += 1
+                    blocked = "not sent: the screen changed while planning, so the target may have moved; re-read it"
+                elif not blocked:
+                    moved_skips = 0
                 step.result = blocked or self.act(screen, plan, step.selection)
             except Exception as ex:  # surface device errors to the planner instead of aborting
                 step.result = f"error: {ex}"
@@ -506,7 +651,11 @@ class QARunner:
             time.sleep(0.3)
 
         if status == "max_steps":
-            final_screen = self.d.observe(with_screenshot=True)
+            final_screen = self._observe(prev_screen, True)[0]
+            if self.steps:
+                # Out of steps is not "nothing achieved": say how far the run got.
+                verified = self.verify(final_screen, self.steps[-1].plan)
+                self.log(f"    verify at step limit p={verified:.2f}")
         state_changes = None
         if state_before is not None:
             state_changes = diff_app_state(state_before, app_state_snapshot(self.d, self.app))
@@ -528,7 +677,9 @@ class QARunner:
             "safe_mode_blocked": self.blocked_taps,
             # None: app data not readable (release build without root); [] : nothing changed
             "app_state_changes": state_changes,
-            "summary": self.steps[-1].plan["observation"] or self.steps[-1].plan["thought"] if self.steps else "",
+            "summary": (self.observations[-1].split(": ", 1)[-1] if status == "stopped" or failure_kind == "left_app"
+                        else self.steps[-1].plan["observation"] or self.steps[-1].plan["thought"] if self.steps else ""),
+            "unconfirmed": self.steps[-1].plan.get("unconfirmed", "") if self.steps else "",
             "observations": self.observations,
             "steps": [{"n": s.n, "package": s.package, "purpose": s.plan["purpose"],
                        "action": s.plan["action"], "target": s.plan["target"],

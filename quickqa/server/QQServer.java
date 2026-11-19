@@ -3,7 +3,12 @@
 // Keeps one UiAutomation connection open so each UI dump costs ~100ms instead of ~2.3s
 // for a fresh `uiautomator dump`. Protocol (stdin/stdout, one command per line):
 //   dump  -> uiautomator-compatible XML, then a line "<<END>>"
+//   dump fresh -> same, but every node is re-read from the app (bypasses the accessibility cache)
 //   shot  -> base64 JPEG on one line, then "<<END>>"
+//   taps X Y COUNT INTERVAL_MS HOLD_MS -> injected touches with exact timing (double tap, long press)
+//   swipe X1 Y1 X2 Y2 MS -> injected drag/fling along a straight line
+//   focused -> base64 UTF-8 text of the focused input field ("" if empty), or "none"
+//   settext B64 -> replace the focused input field's text (ACTION_SET_TEXT; bypasses the keyboard/IME)
 //   quit
 import android.accessibilityservice.AccessibilityServiceInfo;
 import android.app.UiAutomation;
@@ -11,6 +16,9 @@ import android.graphics.Bitmap;
 import android.graphics.Rect;
 import android.os.HandlerThread;
 import android.os.Looper;
+import android.os.SystemClock;
+import android.view.InputDevice;
+import android.view.MotionEvent;
 import android.util.Base64;
 import android.view.accessibility.AccessibilityNodeInfo;
 
@@ -56,8 +64,29 @@ public class QQServer {
         while ((line = in.readLine()) != null) {
             line = line.trim();
             try {
-                if (line.equals("dump")) {
-                    out.print(dump());
+                if (line.equals("dump") || line.equals("dump fresh")) {
+                    out.print(dump(line.endsWith("fresh")));
+                } else if (line.startsWith("taps ")) {
+                    String[] a = line.split(" ");
+                    taps(Float.parseFloat(a[1]), Float.parseFloat(a[2]), Integer.parseInt(a[3]),
+                            Long.parseLong(a[4]), Long.parseLong(a[5]));
+                    out.print("ok\n");
+                } else if (line.startsWith("swipe ")) {
+                    String[] a = line.split(" ");
+                    swipe(Float.parseFloat(a[1]), Float.parseFloat(a[2]), Float.parseFloat(a[3]),
+                            Float.parseFloat(a[4]), Long.parseLong(a[5]));
+                    out.print("ok\n");
+                } else if (line.equals("focused")) {
+                    AccessibilityNodeInfo f = focusedInput();
+                    CharSequence t = f == null || f.isShowingHintText() ? null : f.getText();
+                    out.print(f == null ? "none\n" : b64(t == null ? "" : t.toString()) + "\n");
+                } else if (line.startsWith("settext")) {
+                    String text = new String(Base64.decode(line.substring(7).trim(), Base64.DEFAULT), "UTF-8");
+                    AccessibilityNodeInfo f = focusedInput();
+                    android.os.Bundle args = new android.os.Bundle();
+                    args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text);
+                    boolean ok = f != null && f.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args);
+                    out.print(ok ? "ok\n" : "ERR set text failed\n");
                 } else if (line.equals("shot")) {
                     out.print(shot());
                 } else if (line.equals("quit")) {
@@ -112,7 +141,10 @@ public class QQServer {
         return u;
     }
 
-    private static String dump() throws Exception {
+    private static boolean fresh;
+
+    private static String dump(boolean refresh) throws Exception {
+        fresh = refresh;
         try {
             ua.waitForIdle(80, 1500);
         } catch (Exception ignored) {
@@ -131,6 +163,7 @@ public class QQServer {
 
     private static void node(StringBuilder sb, AccessibilityNodeInfo n, int index, int depth) {
         if (n == null || depth > 80) return;
+        if (fresh) n.refresh();
         Rect r = new Rect();
         n.getBoundsInScreen(r);
         sb.append("<node index=\"").append(index).append('"');
@@ -141,6 +174,10 @@ public class QQServer {
         attr(sb, "content-desc", n.getContentDescription());
         CharSequence hint = n.getHintText();
         if (hint != null) attr(sb, "hint", hint);
+        if (android.os.Build.VERSION.SDK_INT >= 30) {
+            CharSequence st = n.getStateDescription();
+            if (st != null) attr(sb, "state-desc", st);
+        }
         bool(sb, "checkable", n.isCheckable());
         bool(sb, "checked", n.isChecked());
         bool(sb, "clickable", n.isClickable());
@@ -186,6 +223,47 @@ public class QQServer {
             }
         }
         sb.append('"');
+    }
+
+    private static void taps(float x, float y, int count, long intervalMs, long holdMs) throws Exception {
+        for (int i = 0; i < count; i++) {
+            if (i > 0) Thread.sleep(intervalMs);
+            long down = SystemClock.uptimeMillis();
+            touch(down, down, MotionEvent.ACTION_DOWN, x, y);
+            if (holdMs > 0) Thread.sleep(holdMs);
+            touch(down, SystemClock.uptimeMillis(), MotionEvent.ACTION_UP, x, y);
+        }
+    }
+
+    private static void swipe(float x1, float y1, float x2, float y2, long ms) throws Exception {
+        long down = SystemClock.uptimeMillis();
+        touch(down, down, MotionEvent.ACTION_DOWN, x1, y1);
+        int steps = (int) Math.max(2, ms / 8);
+        for (int i = 1; i <= steps; i++) {
+            Thread.sleep(Math.max(1, ms / steps));
+            float f = (float) i / steps;
+            touch(down, SystemClock.uptimeMillis(), MotionEvent.ACTION_MOVE, x1 + (x2 - x1) * f, y1 + (y2 - y1) * f);
+        }
+        touch(down, SystemClock.uptimeMillis(), MotionEvent.ACTION_UP, x2, y2);
+    }
+
+    private static AccessibilityNodeInfo focusedInput() {
+        AccessibilityNodeInfo root = ua.getRootInActiveWindow();
+        if (root == null) return null;
+        AccessibilityNodeInfo f = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT);
+        if (f != null) f.refresh();
+        return f;
+    }
+
+    private static String b64(String s) throws Exception {
+        return Base64.encodeToString(s.getBytes("UTF-8"), Base64.NO_WRAP);
+    }
+
+    private static void touch(long down, long t, int action, float x, float y) {
+        MotionEvent e = MotionEvent.obtain(down, t, action, x, y, 0);
+        e.setSource(InputDevice.SOURCE_TOUCHSCREEN);
+        if (!ua.injectInputEvent(e, true)) throw new IllegalStateException("injectInputEvent failed");
+        e.recycle();
     }
 
     private static String shot() {

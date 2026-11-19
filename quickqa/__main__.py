@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -11,7 +12,21 @@ from pathlib import Path
 from .agent import QARunner
 from .device import Device
 
-EXIT = {"passed": 0, "passed_weak": 0, "passed_with_crash_log": 0, "unverified": 3, "failed": 1, "max_steps": 2}
+EXIT = {"passed": 0, "passed_weak": 0, "passed_with_crash_log": 0, "stopped": 0, "unverified": 3, "failed": 1,
+        "max_steps": 2}
+
+
+def run_hook(name: str, cmd: str) -> dict:
+    """Run a --pre/--post shell command on this PC; its outcome goes into the report."""
+    try:
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           timeout=300)
+        rec = {"hook": name, "cmd": cmd, "exit": r.returncode, "output": (r.stdout + r.stderr)[-1000:]}
+    except Exception as ex:
+        rec = {"hook": name, "cmd": cmd, "exit": None, "output": str(ex)}
+    print(f"HOOK {name}: exit {rec['exit']}" + (f" - {rec['output'].strip()[-300:]}" if rec["exit"] else ""),
+          flush=True)
+    return rec
 
 
 def default_out_dir() -> Path:
@@ -25,7 +40,7 @@ def main(argv=None) -> int:
             s.reconfigure(encoding="utf-8")
         except Exception:
             pass
-    ap = argparse.ArgumentParser(prog="quickqa", description="Fast Android QA executor (Claude Haiku 5.5 planner + TypeSafe Jev selector)")
+    ap = argparse.ArgumentParser(prog="quickqa", description="Fast Android QA executor (Claude Sonnet 5.5 planner + TypeSafe Jev selector)")
     ap.add_argument("task", help="what to do / check, in natural language")
     ap.add_argument("--app", help="package (or package/activity) to launch first")
     ap.add_argument("--device", default=os.environ.get("QUICKQA_DEVICE"),
@@ -49,12 +64,19 @@ def main(argv=None) -> int:
     ap.add_argument("--effort", choices=["none", "low", "medium", "high"], default="medium",
                     help="planner effort (default medium: low failed the long Play Store scenario); none = thinking off")
     ap.add_argument("--planner", choices=["claude", "cerebras"], default="claude")
-    ap.add_argument("--planner-model", help="override the planner model id (default claude-haiku-5-5)")
+    ap.add_argument("--planner-model", help="override the planner model id (default claude-sonnet-5-5; claude-haiku-5-5 is ~20x cheaper)")
     ap.add_argument("--max-input-tokens", type=int, default=100_000,
                     help="per-request planner input ceiling; prompts are shrunk to stay under it (default 100000)")
     ap.add_argument("--out", default=os.environ.get("QUICKQA_OUT", str(default_out_dir())),
                     help="run artifacts directory (default: outside any repo, $QUICKQA_OUT or "
                          "%%LOCALAPPDATA%%/quickqa/runs or ~/.cache/quickqa/runs)")
+    ap.add_argument("--stop-when", metavar="TEXT",
+                    help="end the run as soon as TEXT is on screen (element text), before any further action; "
+                         "status 'stopped'. For 'open it, screenshot it, press nothing' checks")
+    ap.add_argument("--pre", metavar="CMD", help="shell command run on this PC before the run; non-zero exit aborts it")
+    ap.add_argument("--post", metavar="CMD", help="shell command run on this PC after the run, always (even after "
+                                                  "a failed --pre or an error)")
+    ap.add_argument("--shot", metavar="PATH", help="also save the final screen as a full-resolution lossless PNG here")
     ap.add_argument("--save-screens", action="store_true", help="save a screenshot for every step")
     ap.add_argument("--json", action="store_true", help="print the full report JSON instead of a summary")
     ap.add_argument("-q", "--quiet", action="store_true", help="no per-step progress lines")
@@ -71,11 +93,32 @@ def main(argv=None) -> int:
                       reasoning_effort=a.effort, restart_app=a.start == "restart" or a.restart, safe=not a.no_safe,
                       planner=a.planner, planner_model=a.planner_model, max_input_tokens=a.max_input_tokens, image_side=a.image_side,
                       report_lang=a.report_lang, report_image=not a.no_report_image, run_dir=run_dir,
-                      save_screens=a.save_screens, verbose=not a.quiet)
+                      save_screens=a.save_screens, verbose=not a.quiet, stop_when=a.stop_when)
+    print(f"DEVICE: {device.serial}", flush=True)
+    hooks = []
     try:
-        report = runner.run()
+        if a.pre:
+            hooks.append(run_hook("pre", a.pre))
+        if hooks and hooks[0]["exit"] != 0:
+            report = {"task": a.task, "app": a.app, "device": device.serial, "status": "failed",
+                      "failure_kind": "blocked", "verifier_p_done": None, "steps": [], "crash_log": "",
+                      "summary": f"--pre command failed (exit {hooks[0]['exit']}); the run was not started",
+                      "observations": [], "elapsed_s": 0}
+        else:
+            report = runner.run()
+            if a.shot:
+                shot = Path(a.shot).with_suffix(Path(a.shot).suffix or ".png")
+                shot.parent.mkdir(parents=True, exist_ok=True)
+                shot.write_bytes(device.screencap_png())
+                report["shot"] = str(shot)
     finally:
         device.close()
+        if a.post:
+            hooks.append(run_hook("post", a.post))
+    if hooks:
+        report["hooks"] = hooks
+        (run_dir / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), "utf-8")
+        report.setdefault("report_path", str(run_dir / "report.json"))
 
     if a.json:
         print(json.dumps(report, ensure_ascii=False, indent=2))
@@ -83,6 +126,8 @@ def main(argv=None) -> int:
         print(f"\nSTATUS: {report['status']}  (verifier p_done={report['verifier_p_done']}, "
               f"{len(report['steps'])} steps, {report['elapsed_s']}s)")
         print(f"SUMMARY: {report['summary']}")
+        if report.get("unconfirmed"):
+            print(f"UNCONFIRMED: {report['unconfirmed']}")
         pu = report.get("planner_usage", {})
         if "input_tokens" in pu:
             print(f"PLANNER: {pu['model']} {pu['calls']} calls, in {pu['input_tokens']} / out {pu['output_tokens']} "
@@ -103,6 +148,8 @@ def main(argv=None) -> int:
         print(f"REPORT: {report.get('report_path')}")
         if report.get("final_screenshot"):
             print(f"FINAL SCREENSHOT: {report['final_screenshot']}")
+        if report.get("shot"):
+            print(f"SHOT: {report['shot']}")
     return EXIT.get(report["status"], 1)
 
 
